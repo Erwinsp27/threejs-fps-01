@@ -1,5 +1,9 @@
 # DUSTLINE — Tactical FPS
 
+[![threejs-fps-01](https://make.fun/badge/threejs-fps-01.svg)](https://make.fun/bounty/threejs-fps-01)
+[![rank](https://make.fun/badge/threejs-fps-01/Erwinsp27/threejs-fps-01/rank.svg)](https://make.fun/bounty/threejs-fps-01)
+[![reward](https://make.fun/badge/threejs-fps-01/Erwinsp27/threejs-fps-01/reward.svg)](https://make.fun/bounty/threejs-fps-01)
+
 An original Counter-Strike-style tactical first-person shooter built on
 three.js 0.187.0, entered in make.fun's **threejs-fps-01** bounty
 ("Build the best FPS with three.js"). Single-player against nine bots, from
@@ -103,3 +107,6 @@ vendor/
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+Built for make.fun's [threejs-fps-01 — "Build the best FPS with three.js"](https://make.fun/bounty/threejs-fps-01) bounty ($1,000 in USDC).
