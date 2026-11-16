@@ -1,60 +1,54 @@
-// DUSTLINE — live playtest: drives the fixed-step simulation directly through
-// window.__dustline.advance() (headless renderers throttle requestAnimationFrame,
-// so real-time waiting proves nothing). Verifies: buy -> live, bots fight and
-// die, a round ends, the next round starts, and no page errors appear.
-import { chromium } from 'playwright-core';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import { dirname } from 'node:path';
+// playtest.mjs — a live headless playtest of DUSTLINE.
+// Loads the game in test mode (3 s buy, 25 s live rounds), fires the
+// player's weapon once with a synthetic mouse press, then waits for round 1
+// to end and round 2 to start. Passes only with zero page errors, shots
+// fired by the bots, and a round turnover. Run: node playtest.mjs
 
-const here = dirname(fileURLToPath(import.meta.url));
-const server = spawn('node', ['serve.ts', '--port', '8094'], { cwd: here, stdio: 'ignore' });
-await new Promise((r) => setTimeout(r, 1200));
+import { CDP, startGameServer, stopServer, sleep } from './cdp.mjs';
 
-const browser = await chromium.launch({
-  executablePath: process.env.CHROMIUM_PATH || undefined,
-  args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--disable-gpu-sandbox', '--no-sandbox', '--disable-dev-shm-usage'],
-});
-const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-let errors = 0;
-page.on('pageerror', (e) => { errors += 1; console.log('[pageerror]', String(e).slice(0, 300)); });
-page.on('console', (m) => { if (m.type() === 'error') { errors += 1; console.log('[console.error]', m.text().slice(0, 300)); } });
+const PORT = 8137;
+const BASE = `http://127.0.0.1:${PORT}/index.html?test=1`;
 
-await page.goto('http://127.0.0.1:8094/', { waitUntil: 'load' });
-await page.click('#start-btn');
-
-const sample = () => page.evaluate(() => {
-  const d = window.__dustline;
-  if (!d) return null;
-  const s = d.state;
-  return {
-    phase: s.phase, round: s.round, t: Math.round(s.roundTimeLeft),
-    score: `${s.score.vanguard}-${s.score.jackals}`,
-    hp: Math.round(d.player.hp), alive: d.player.alive,
-    vAlive: s.bots.filter((b) => b.team === 'vanguard' && b.alive).length,
-    jAlive: s.bots.filter((b) => b.team === 'jackals' && b.alive).length,
-    bomb: s.bomb.state, money: s.money, kills: s.kills, feed: s.killfeed.length,
-  };
-});
-const advance = (sec) => page.evaluate((s) => window.__dustline.advance(s), sec);
-
-console.log('start:', JSON.stringify(await sample()));
-console.log('advance 13s (buy phase):', JSON.stringify(await advance(13)));
-console.log('after buy:', JSON.stringify(await sample()));
-let roundEnded = false;
-for (let i = 0; i < 14; i++) {
-  await advance(10);
-  const s = await sample();
-  console.log(`+${(i + 1) * 10}s live:`, JSON.stringify(s));
-  if (s.phase === 'roundEnd' || s.phase === 'matchEnd') { roundEnded = true; break; }
-  if (!s) break;
+const server = await startGameServer(PORT);
+const cdp = new CDP(9222);
+const results = [];
+function check(name, ok, detail) {
+  results.push({ name, ok, detail });
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}`);
 }
-console.log(roundEnded ? 'ROUND ENDED — round flow works' : 'ROUND DID NOT END in 140 sim-seconds');
-if (roundEnded) {
-  await advance(5);
-  console.log('after round end:', JSON.stringify(await sample()));
+
+let exitCode = 0;
+try {
+  await cdp.launch('about:blank');
+  await cdp.newTarget(BASE);
+  await cdp.waitFor('window.__DUSTLINE !== undefined', 30000);
+  await cdp.waitFor('document.querySelector("#game canvas") !== null', 10000);
+
+  // Wait for the live phase, then fire the player's weapon once.
+  await cdp.waitFor('window.__DUSTLINE.phase === "live"', 20000);
+  const shotsBefore = await cdp.evaluate('window.__DUSTLINE.shots');
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: 640, y: 360, button: 'left', clickCount: 1 });
+  await sleep(800);
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 640, y: 360, button: 'left', clickCount: 1 });
+  const shotsAfterClick = await cdp.evaluate('window.__DUSTLINE.shots');
+  check('player weapon fires on click', shotsAfterClick > shotsBefore, `shots ${shotsBefore} -> ${shotsAfterClick}`);
+
+  // The round must end and the next one must start on its own.
+  await cdp.waitFor('window.__DUSTLINE.round >= 2', 90000);
+  const end = await cdp.evaluate(
+    '(() => ({ phase: window.__DUSTLINE.phase, round: window.__DUSTLINE.round, shots: window.__DUSTLINE.shots, score: window.__DUSTLINE.score }))()',
+  );
+  check('round 1 ends and round 2 starts', end.round >= 2, `round ${end.round}, phase ${end.phase}`);
+  check('bots fight (shots fired)', end.shots > 10, `${end.shots} shots total`);
+  check('score recorded', end.score.V + end.score.J >= 1, `V ${end.score.V} — J ${end.score.J}`);
+  check('zero page errors', cdp.errors.length === 0, cdp.errors.join(' | ') || 'none');
+} catch (err) {
+  check('playtest completed', false, String(err && err.message ? err.message : err));
+} finally {
+  await cdp.close();
+  stopServer(server);
 }
-await browser.close();
-server.kill();
-console.log(errors ? `${errors} page error(s)` : 'NO PAGE ERRORS');
-process.exit(errors || !roundEnded ? 1 : 0);
+
+exitCode = results.every((r) => r.ok) ? 0 : 1;
+console.log(exitCode === 0 ? 'playtest: ALL PASS' : 'playtest: FAILED');
+process.exit(exitCode);

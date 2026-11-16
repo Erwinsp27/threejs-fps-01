@@ -1,87 +1,144 @@
-// DUSTLINE — audio: every sound is synthesized with WebAudio, no audio files and
-// no network. A gunshot is a noise burst through a low-pass filter plus a low
-// thump; the rest are small oscillator phrases.
-export function createAudio() {
-  let ctx = null;
-  let master = null;
-  let enabled = true;
+// audio.js — every sound is synthesized with WebAudio. No audio files,
+// no network: a shared noise buffer, oscillators and filters, with distance
+// attenuation for gunfire. Safe to call before any user gesture; the
+// context is created lazily on the first ensure() after interaction.
 
-  function ensure() {
-    if (ctx) return true;
-    try {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return false;
-      ctx = new AC();
-      master = ctx.createGain();
-      master.gain.value = 0.32;
-      master.connect(ctx.destination);
-    } catch {
-      return false;
-    }
+let ctx = null;
+let noiseBuf = null;
+let master = null;
+
+export function ensureAudio() {
+  if (ctx) {
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
     return true;
   }
-
-  function noiseBuffer(dur) {
-    const len = Math.max(1, Math.floor(ctx.sampleRate * dur));
-    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
-    return buf;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    ctx = new AC();
+    master = ctx.createGain();
+    master.gain.value = 0.5;
+    master.connect(ctx.destination);
+    // Two seconds of white noise, reused by every percussive sound.
+    noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const data = noiseBuf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    return true;
+  } catch (_) {
+    return false;
   }
-
-  function burst(dur, filterFreq, gain, type = 'lowpass') {
-    if (!ensure() || !enabled) return;
-    const t = ctx.currentTime;
-    const src = ctx.createBufferSource();
-    src.buffer = noiseBuffer(dur);
-    const f = ctx.createBiquadFilter();
-    f.type = type; f.frequency.value = filterFreq;
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(gain, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    src.connect(f); f.connect(g); g.connect(master);
-    src.start(t);
-  }
-
-  function tone(freq, dur, gain, type = 'sine', slideTo = null) {
-    if (!ensure() || !enabled) return;
-    const t = ctx.currentTime;
-    const o = ctx.createOscillator();
-    o.type = type; o.frequency.setValueAtTime(freq, t);
-    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(gain, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    o.connect(g); g.connect(master);
-    o.start(t); o.stop(t + dur);
-  }
-
-  return {
-    unlock() { ensure(); if (ctx && ctx.state === 'suspended') ctx.resume(); },
-    toggle() { enabled = !enabled; return enabled; },
-    play(name, head = false, bot = null) {
-      if (!ensure() || !enabled) return;
-      // Distant bot shots are quieter and duller.
-      const dist = bot ? 0.35 : 1;
-      switch (name) {
-        case 'rifle': burst(0.12, 1800, 0.5 * dist); tone(120, 0.09, 0.3 * dist, 'sine', 55); break;
-        case 'smg': burst(0.09, 2200, 0.4 * dist); tone(150, 0.06, 0.22 * dist, 'sine', 70); break;
-        case 'pistol': burst(0.1, 2600, 0.42 * dist); tone(170, 0.07, 0.2 * dist, 'sine', 80); break;
-        case 'sniper': burst(0.22, 900, 0.7 * dist); tone(90, 0.2, 0.4 * dist, 'sine', 40); break;
-        case 'dry': tone(1200, 0.04, 0.12, 'square'); break;
-        case 'reload': tone(700, 0.05, 0.12, 'square'); setTimeout(() => tone(500, 0.05, 0.12, 'square'), 180); break;
-        case 'hit': tone(head ? 2400 : 1800, 0.06, 0.2, 'sine'); break;
-        case 'kill': tone(880, 0.08, 0.2, 'sine'); setTimeout(() => tone(1320, 0.1, 0.2, 'sine'), 90); break;
-        case 'explode': burst(0.7, 400, 0.9); tone(60, 0.5, 0.5, 'sine', 30); break;
-        case 'smoke': burst(0.5, 800, 0.25, 'bandpass'); break;
-        case 'plant': tone(1000, 0.09, 0.2, 'square'); setTimeout(() => tone(1000, 0.09, 0.2, 'square'), 200); break;
-        case 'defuse': tone(1400, 0.09, 0.2, 'square'); setTimeout(() => tone(1400, 0.09, 0.2, 'square'), 200); break;
-        case 'roundWin': [523, 659, 784].forEach((f, i) => setTimeout(() => tone(f, 0.18, 0.22, 'triangle'), i * 130)); break;
-        case 'roundLose': [392, 330, 262].forEach((f, i) => setTimeout(() => tone(f, 0.2, 0.22, 'triangle'), i * 140)); break;
-        case 'buy': tone(660, 0.06, 0.15, 'sine'); break;
-        case 'click': tone(900, 0.03, 0.1, 'square'); break;
-        default: break;
-      }
-    },
-  };
 }
+
+function noiseSrc() {
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuf;
+  return src;
+}
+
+// Volume falls off with distance: full inside 8 m, gone by 60 m.
+function distGain(dist) {
+  if (dist === undefined) return 1;
+  return Math.max(0, 1 - Math.max(0, dist - 8) / 52);
+}
+
+function playNoise({ dur, type = 'bandpass', freq = 1200, q = 1, gain = 0.5, at = 0, dist }) {
+  if (!ctx) return;
+  const t = ctx.currentTime + at;
+  const src = noiseSrc();
+  const filter = ctx.createBiquadFilter();
+  filter.type = type;
+  filter.frequency.value = freq;
+  filter.Q.value = q;
+  const g = ctx.createGain();
+  const vol = gain * distGain(dist);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  src.connect(filter);
+  filter.connect(g);
+  g.connect(master);
+  src.start(t);
+  src.stop(t + dur + 0.02);
+}
+
+function playTone({ freq, freqEnd, dur, type = 'sine', gain = 0.3, at = 0 }) {
+  if (!ctx) return;
+  const t = ctx.currentTime + at;
+  const osc = ctx.createOscillator();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t);
+  if (freqEnd !== undefined) osc.frequency.exponentialRampToValueAtTime(Math.max(1, freqEnd), t + dur);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(gain, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  osc.connect(g);
+  g.connect(master);
+  osc.start(t);
+  osc.stop(t + dur + 0.02);
+}
+
+export const sfx = {
+  shot(weapon, dist) {
+    if (!ctx) return;
+    if (weapon === 'shotgun') {
+      playNoise({ dur: 0.28, freq: 900, q: 0.6, gain: 0.9, dist });
+      playTone({ freq: 120, freqEnd: 45, dur: 0.22, type: 'triangle', gain: 0.5 });
+    } else if (weapon === 'dmr') {
+      playNoise({ dur: 0.3, freq: 1600, q: 0.8, gain: 0.85, dist });
+      playTone({ freq: 100, freqEnd: 40, dur: 0.3, type: 'triangle', gain: 0.55 });
+    } else if (weapon === 'rifle') {
+      playNoise({ dur: 0.12, freq: 2200, q: 0.9, gain: 0.55, dist });
+      playTone({ freq: 160, freqEnd: 60, dur: 0.12, type: 'triangle', gain: 0.35 });
+    } else {
+      playNoise({ dur: 0.09, freq: 2800, q: 1.2, gain: 0.45, dist });
+      playTone({ freq: 200, freqEnd: 80, dur: 0.09, type: 'triangle', gain: 0.25 });
+    }
+  },
+  dry() {
+    playTone({ freq: 1400, dur: 0.03, type: 'square', gain: 0.12 });
+  },
+  reload() {
+    playTone({ freq: 900, dur: 0.04, type: 'square', gain: 0.15 });
+    playTone({ freq: 600, dur: 0.04, type: 'square', gain: 0.15, at: 0.18 });
+    playTone({ freq: 1100, dur: 0.05, type: 'square', gain: 0.18, at: 0.45 });
+  },
+  hit(head) {
+    playTone({ freq: head ? 2400 : 1800, dur: 0.06, type: 'sine', gain: 0.3 });
+  },
+  kill() {
+    playTone({ freq: 880, dur: 0.08, type: 'sine', gain: 0.3 });
+    playTone({ freq: 1320, dur: 0.12, type: 'sine', gain: 0.3, at: 0.08 });
+  },
+  hurt() {
+    playNoise({ dur: 0.15, type: 'lowpass', freq: 400, gain: 0.4 });
+    playTone({ freq: 90, freqEnd: 50, dur: 0.2, type: 'sawtooth', gain: 0.2 });
+  },
+  explode(dist) {
+    playNoise({ dur: 1.1, type: 'lowpass', freq: 500, gain: 1.0, dist });
+    playTone({ freq: 90, freqEnd: 28, dur: 0.9, type: 'sine', gain: 0.9 });
+    playNoise({ dur: 0.4, freq: 3000, q: 0.5, gain: 0.3, at: 0.05, dist });
+  },
+  plant() {
+    playTone({ freq: 1200, dur: 0.1, type: 'square', gain: 0.2 });
+    playTone({ freq: 1200, dur: 0.1, type: 'square', gain: 0.2, at: 0.2 });
+  },
+  beep() {
+    playTone({ freq: 1500, dur: 0.07, type: 'square', gain: 0.18 });
+  },
+  defuse() {
+    playTone({ freq: 1000, dur: 0.08, type: 'sine', gain: 0.2 });
+    playTone({ freq: 1400, dur: 0.08, type: 'sine', gain: 0.2, at: 0.12 });
+  },
+  buy() {
+    playTone({ freq: 700, dur: 0.05, type: 'triangle', gain: 0.25 });
+    playTone({ freq: 1050, dur: 0.07, type: 'triangle', gain: 0.25, at: 0.06 });
+  },
+  roundWin() {
+    [523, 659, 784].forEach((f, i) => playTone({ freq: f, dur: 0.18, type: 'triangle', gain: 0.3, at: i * 0.12 }));
+  },
+  roundLose() {
+    [392, 330, 262].forEach((f, i) => playTone({ freq: f, dur: 0.2, type: 'triangle', gain: 0.28, at: i * 0.13 }));
+  },
+  throw_() {
+    playNoise({ dur: 0.12, freq: 600, q: 1, gain: 0.25 });
+  },
+};

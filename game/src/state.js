@@ -1,111 +1,262 @@
-// DUSTLINE — the one place the game's state lives.
-// Everything mutable about a match sits in the object `createState()` returns;
-// modules read and write it but never keep a second copy of it. Constants
-// (weapons, economy, match rules) are frozen here so the game's rules can be
-// read in one file.
+// state.js — the single source of truth for a DUSTLINE match.
+// The simulation owns this object; rendering only reads it. Nothing here
+// imports three.js, so the rules of the game can be reasoned about (and
+// tested) without a renderer.
 
-export const MATCH = Object.freeze({
-  roundsToWin: 5,
-  maxRounds: 9,
-  roundTime: 100,      // seconds of live play per round
-  buyTime: 12,         // seconds to buy before the round starts
-  plantTime: 3.5,      // seconds holding E to plant
-  defuseTime: 5,       // seconds holding E to defuse
-  bombTimer: 35,       // seconds from plant to detonation
-  roundEndPause: 4,    // seconds the banner shows before the next round
-  playerHp: 100,
-  startMoney: 800,
-});
+export const DT = 1 / 60;
+export const BUY_TIME = 12; // seconds of buy phase at the start of a round
+export const ROUND_TIME = 100; // seconds of live play per round
+export const PLANT_TIME = 3.5; // seconds to plant the bomb
+export const DEFUSE_TIME = 5; // seconds to defuse the bomb
+export const BOMB_TIME = 35; // seconds from plant to detonation
+export const WIN_ROUNDS = 5; // first team to this many rounds wins
+export const MAX_ROUNDS = 9; // the match never runs longer than this
+export const END_TIME = 6; // seconds the round-end banner stays up
+export const START_MONEY = 800;
+export const KILL_REWARD = 300;
+export const WIN_REWARD = 3250;
+export const LOSS_REWARD = 1900;
+export const LOSS_STREAK_STEP = 500;
+export const LOSS_STREAK_CAP = 3400;
 
-export const ECONOMY = Object.freeze({
-  kill: 300,
-  roundWin: 3250,
-  roundLoss: 1900,
-  lossStreakBonus: 500,  // +500 per consecutive loss, capped by maxLossBonus
-  maxLossBonus: 1500,
-  plant: 300,
-  defuse: 300,
-});
+export const TEAM_NAMES = { V: 'Vanguard', J: 'Jackals' };
 
-// Weapon table. damage is body damage at close range; falloff starts at
-// falloffStart metres and bottoms out at falloffMin. headMult multiplies damage
-// on a head hit. spread is in radians at rest; bloom adds per shot, moving
-// and crouching change it further.
-export const WEAPONS = Object.freeze({
-  p9: {
-    id: 'p9', name: 'P9 Sidearm', price: 0, auto: false,
-    damage: 30, headMult: 2.5, falloffStart: 18, falloffMin: 0.6,
-    rate: 320, mag: 12, reserve: 36, reload: 1.5,
-    spread: 0.011, bloom: 0.004, moveSpread: 0.02, recoil: 0.011, kick: 0.35,
-    range: 60, tracer: 0xffd9a0, sound: 'pistol',
-  },
-  hornet: {
-    id: 'hornet', name: 'VK-9 Hornet', price: 1500, auto: true,
-    damage: 26, headMult: 2.5, falloffStart: 16, falloffMin: 0.55,
-    rate: 780, mag: 30, reserve: 90, reload: 2.1,
-    spread: 0.016, bloom: 0.003, moveSpread: 0.026, recoil: 0.009, kick: 0.3,
-    range: 55, tracer: 0xffe9a8, sound: 'smg',
-  },
-  longshot: {
-    id: 'longshot', name: 'AR-7 Longshot', price: 2700, auto: true,
-    damage: 34, headMult: 2.5, falloffStart: 24, falloffMin: 0.7,
-    rate: 600, mag: 30, reserve: 90, reload: 2.4,
-    spread: 0.007, bloom: 0.0025, moveSpread: 0.03, recoil: 0.013, kick: 0.5,
-    range: 90, tracer: 0xffe9a8, sound: 'rifle',
-  },
-  deadeye: {
-    id: 'deadeye', name: 'LW-50 Deadeye', price: 4750, auto: false,
-    damage: 110, headMult: 2.3, falloffStart: 40, falloffMin: 0.85,
-    rate: 55, mag: 5, reserve: 15, reload: 3.2,
-    spread: 0.001, bloom: 0.001, moveSpread: 0.05, recoil: 0.05, kick: 2.2,
-    range: 120, tracer: 0xcfe8ff, sound: 'sniper',
-  },
-});
+// Roster: the player is agent 0 on Vanguard; everyone else is a bot.
+const ROSTER = [
+  { name: 'You', team: 'V', bot: false },
+  { name: 'Rook', team: 'V', bot: true },
+  { name: 'Havoc', team: 'V', bot: true },
+  { name: 'Sable', team: 'V', bot: true },
+  { name: 'Wren', team: 'V', bot: true },
+  { name: 'Dagger', team: 'J', bot: true },
+  { name: 'Onyx', team: 'J', bot: true },
+  { name: 'Vex', team: 'J', bot: true },
+  { name: 'Krait', team: 'J', bot: true },
+  { name: 'Moss', team: 'J', bot: true },
+];
 
-export const GRENADES = Object.freeze({
-  popper: { id: 'popper', name: 'Popper Frag', price: 300, kind: 'frag', radius: 7, damage: 110 },
-  veil: { id: 'veil', name: 'Veil Smoke', price: 300, kind: 'smoke', radius: 5, duration: 14 },
-});
-
-// Deterministic RNG (mulberry32). One instance per match, seeded from the URL
-// (?seed=N) for screenshots or from the clock for live play, so a staged frame
-// is reproducible and two runs of main.ts write the same bytes.
-export function makeRng(seed) {
-  let a = seed >>> 0;
-  return function rng() {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+export function makeAgent(def, id) {
+  return {
+    id,
+    name: def.name,
+    team: def.team,
+    bot: def.bot,
+    alive: true,
+    hp: 100,
+    // pos is the agent's feet. y is 0 on the ground everywhere in the yard.
+    pos: { x: 0, y: 0, z: 0 },
+    yaw: 0,
+    pitch: 0,
+    vel: { x: 0, z: 0 },
+    crouch: false,
+    moving: false,
+    // Loadout. Everyone starts with the free sidearm; primaries are bought.
+    weapon: 'pistol',
+    primary: null,
+    mag: 12,
+    reserve: 36,
+    reloading: false,
+    reloadT: 0,
+    fireCd: 0,
+    bloom: 0,
+    recoil: 0,
+    grenades: { smoke: 0, frag: 0 },
+    money: START_MONEY,
+    kills: 0,
+    deaths: 0,
+    hasBomb: false,
+    planting: false,
+    plantT: 0,
+    defusing: false,
+    defuseT: 0,
+    // --- bot brain (unused by the player) ---
+    role: 'push', // push | hold | rotate | plant | defuse | guard
+    lane: 'mid', // a | mid | b — the lane this bot committed to
+    site: null, // 'A' | 'B' — the site this bot is playing
+    holdNode: -1, // waypoint index this bot is holding at
+    path: [], // waypoint indices to follow
+    pathIdx: 0,
+    thinkT: 0, // countdown to the next decision tick
+    reactionT: 0, // countdown before the bot may open fire
+    burstLeft: 0, // shots left in the current burst
+    burstPause: 0, // pause between bursts
+    strafeDir: 1,
+    strafeT: 0,
+    targetId: -1, // agent id this bot is fighting, or -1
+    lastSeen: null, // {x, z} where the bot last saw an enemy
+    heard: null, // {x, z, t} of the last gunfire the bot heard
+    skill: 0.8 + Math.random() * 0.5, // aim error multiplier, rolled per bot
   };
 }
 
-export function createState(seed) {
-  return {
-    rng: makeRng(seed),
-    seed,
-    phase: 'menu',        // menu | buy | live | roundEnd | matchEnd
-    phaseT: 0,            // seconds in the current phase
+export function createGame() {
+  const S = {
+    phase: 'buy', // buy | live | end | match
+    phaseT: BUY_TIME,
     round: 1,
-    score: { vanguard: 0, jackals: 0 },
-    lossStreak: { vanguard: 0, jackals: 0 },
-    roundTimeLeft: MATCH.roundTime,
-    bomb: { state: 'idle', site: null, x: 0, z: 0, timer: 0, planter: null, defuser: null, progress: 0 },
-    player: null,         // filled by player.js
-    bots: [],             // filled by bots.js
-    entities: [],         // live grenades
-    tracers: [],          // pooled tracer pool (effects.js owns the pool)
-    particles: [],        // pooled particle pool
-    sounds: [],           // queued sound events, drained by audio.js each frame
-    noiseEvents: [],      // {x, z, radius, t} — gunfire bots can hear
-    killfeed: [],         // {text, killer, victim, t} — newest first
-    banner: null,         // {title, sub, t} — round/match banner
-    money: MATCH.startMoney,
-    buyOpen: false,
-    winner: null,         // 'vanguard' | 'jackals' | null
+    score: { V: 0, J: 0 },
+    lossStreak: { V: 0, J: 0 },
+    roundWinner: null,
+    roundReason: '',
     matchWinner: null,
-    time: 0,              // total sim seconds
-    kills: 0, deaths: 0, plants: 0, defuses: 0,
-    shot: null,           // screenshot staging mode, null in live play
+    bomb: {
+      state: 'carried', // carried | dropped | planted | exploded | defused
+      carrier: 1, // agent id carrying it (Rook, first round)
+      site: null, // 'A' | 'B' once planted
+      pos: null, // {x, z} when dropped or planted
+      timer: BOMB_TIME,
+      beepT: 0,
+    },
+    agents: ROSTER.map((d, i) => makeAgent(d, i)),
+    projectiles: [], // live grenades in flight
+    smokes: [], // active smoke clouds {x, y, z, r, ttl}
+    events: [], // transient events, drained once per tick by audio/effects/hud
+    time: 0, // total sim seconds since match start
+    roundKills: 0,
+    shotCount: 0,
   };
+  return S;
+}
+
+export function playerOf(S) {
+  return S.agents[0];
+}
+
+export function aliveOf(S, team) {
+  let n = 0;
+  for (const a of S.agents) if (a.team === team && a.alive) n++;
+  return n;
+}
+
+export function teamAlive(S, team) {
+  return S.agents.filter((a) => a.team === team && a.alive);
+}
+
+export function emit(S, type, data) {
+  S.events.push({ type, ...data });
+}
+
+export function resetAgentForRound(S, a, spawn) {
+  a.alive = true;
+  a.hp = 100;
+  a.pos.x = spawn.x;
+  a.pos.y = 0;
+  a.pos.z = spawn.z;
+  a.yaw = spawn.yaw;
+  a.pitch = 0;
+  a.vel.x = 0;
+  a.vel.z = 0;
+  a.crouch = false;
+  a.reloading = false;
+  a.reloadT = 0;
+  a.fireCd = 0;
+  a.bloom = 0;
+  a.recoil = 0;
+  a.planting = false;
+  a.plantT = 0;
+  a.defusing = false;
+  a.defuseT = 0;
+  a.path = [];
+  a.pathIdx = 0;
+  a.targetId = -1;
+  a.lastSeen = null;
+  a.heard = null;
+  a.burstLeft = 0;
+  a.burstPause = 0;
+  a.reactionT = 0;
+  a.thinkT = Math.random() * 0.2;
+  // Ammo is refilled for owned weapons every round; grenades stay spent.
+  if (a.weapon === 'pistol') {
+    a.mag = 12;
+    a.reserve = 36;
+  } else {
+    a.mag = 30;
+    a.reserve = 90;
+  }
+}
+
+export function startRound(S, spawns) {
+  // The bomb goes to a random living Vanguard bot each round, never the
+  // player on round 1 (Rook carries first so the player learns the flow).
+  const carriers = S.agents.filter((a) => a.team === 'V' && a.bot);
+  const carrier = carriers[Math.floor(Math.random() * carriers.length)];
+  for (const a of S.agents) {
+    const sp = spawns[a.team][a.id % spawns[a.team].length];
+    resetAgentForRound(S, a, sp);
+    a.hasBomb = a === carrier;
+  }
+  S.bomb.state = 'carried';
+  S.bomb.carrier = carrier.id;
+  S.bomb.site = null;
+  S.bomb.pos = null;
+  S.bomb.timer = BOMB_TIME;
+  S.bomb.beepT = 0;
+  S.projectiles.length = 0;
+  S.smokes.length = 0;
+  S.roundKills = 0;
+  S.phase = 'buy';
+  S.phaseT = BUY_TIME;
+  S.roundWinner = null;
+  S.roundReason = '';
+  emit(S, 'roundStart', { round: S.round });
+}
+
+export function endRound(S, winner, reason) {
+  if (S.phase === 'end' || S.phase === 'match') return;
+  S.roundWinner = winner;
+  S.roundReason = reason;
+  S.score[winner]++;
+  const loser = winner === 'V' ? 'J' : 'V';
+  S.lossStreak[loser]++;
+  S.lossStreak[winner] = 0;
+  // Economy: winners take the big purse, losers the consolation plus a
+  // growing streak bonus so a team losing rounds in a row can still buy.
+  for (const a of S.agents) {
+    if (a.team === winner) a.money += WIN_REWARD;
+    else {
+      const bonus = Math.min(
+        LOSS_REWARD + LOSS_STREAK_STEP * (S.lossStreak[loser] - 1),
+        LOSS_STREAK_CAP,
+      );
+      a.money += bonus;
+    }
+    // Dying costs you your primary: you keep the sidearm and your grenades.
+    if (!a.alive && a.primary) {
+      a.primary = null;
+      a.weapon = 'pistol';
+      a.mag = 12;
+      a.reserve = 36;
+    }
+  }
+  S.phase = 'end';
+  S.phaseT = END_TIME;
+  emit(S, 'roundEnd', { winner, reason, round: S.round });
+  if (S.score[winner] >= WIN_ROUNDS || S.round >= MAX_ROUNDS) {
+    S.matchWinner = S.score.V > S.score.J ? 'V' : S.score.J > S.score.V ? 'J' : null;
+    S.phase = 'match';
+    emit(S, 'matchEnd', { winner: S.matchWinner });
+  }
+}
+
+// Called every live tick: returns the round winner when the round is over.
+export function checkRoundEnd(S) {
+  if (S.phase !== 'live') return null;
+  if (S.bomb.state === 'exploded') {
+    return { winner: 'V', reason: 'Bomb detonated at Site ' + S.bomb.site };
+  }
+  const vAlive = aliveOf(S, 'V');
+  const jAlive = aliveOf(S, 'J');
+  const planted = S.bomb.state === 'planted';
+  if (!planted) {
+    if (vAlive === 0) return { winner: 'J', reason: 'Vanguard eliminated' };
+    if (jAlive === 0) return { winner: 'V', reason: 'Jackals eliminated' };
+    if (S.phaseT <= 0) return { winner: 'J', reason: 'Time expired — bomb never planted' };
+  } else {
+    // Bomb is down: attackers may all be dead, the round rides on the bomb.
+    if (vAlive === 0 && S.bomb.state === 'planted') {
+      // Defenders still have to stop it; the timer decides.
+    }
+    if (S.bomb.timer <= 0) return { winner: 'V', reason: 'Bomb detonated at Site ' + S.bomb.site };
+  }
+  return null;
 }

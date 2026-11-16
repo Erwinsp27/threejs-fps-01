@@ -1,1 +1,1 @@
-[{"name":"1-start.jpg","query":"?shot=start&seed=1"},{"name":"2-fight.jpg","query":"?shot=fight&seed=1"},{"name":"3-site.jpg","query":"?shot=site&seed=1"},{"name":"4-end.jpg","query":"?shot=end&seed=1"}]
+{"height":720,"shots":[{"file":"1-start.jpg","url":"/index.html?shot=1","waitMs":6000},{"file":"2-fight.jpg","url":"/index.html?shot=2","waitMs":10000},{"file":"3-site.jpg","url":"/index.html?shot=3","waitMs":14000},{"file":"4-end.jpg","url":"/index.html?shot=4","waitMs":10000}],"width":1280}

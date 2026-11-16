@@ -1,496 +1,575 @@
-// DUSTLINE — main: bootstrap, the fixed-step loop, the round flow and the player's
-// shooting. The simulation runs at a fixed 60 Hz, apart from rendering; the render
-// loop only reads state and draws it. Nothing here allocates in the hot loop.
+// main.js — DUSTLINE bootstrap. Wires the sim (state, world, combat, bots)
+// to the renderer (three.js), the HUD and the sound synth, and runs the
+// fixed 60 Hz simulation apart from rendering. The sim never allocates in
+// its hot loop; the render side reuses preallocated vectors and pooled
+// effects.
+//
+// URL modes (for testing and screenshots, never for play):
+//   ?auto=1   skip the click-to-play screen and start at once
+//   ?test=1   short rounds (3 s buy, 25 s live) for automated playtests
+//   ?shot=N   autopilot camera presets for the four screenshots
+
 import * as THREE from 'three';
-import { createState, MATCH, WEAPONS, GRENADES, ECONOMY } from './state.js';
-import { buildWorld } from './world.js';
-import { createPlayer, resetPlayer, stepPlayer, updateCamera, groundSpeed } from './player.js';
-import { tryFire, startReload, buyWeapon, buyGrenade, throwGrenade, currentSpread } from './weapons.js';
-import { createBots, resetBots, stepBots } from './bots.js';
-import { resolveShot, endRound, stepGrenades } from './combat.js';
-import { createEffects } from './effects.js';
-import { createAudio } from './audio.js';
-import { createHud } from './hud.js';
+import { COLORS, TEAM } from './palette.js';
+import {
+  createGame, startRound, endRound, checkRoundEnd, playerOf, DT, ROUND_TIME,
+} from './state.js';
+import { SPAWNS, SITES, buildWorld } from './world.js';
 import { createInput } from './input.js';
-import { PALETTE } from './palette.js';
+import { updatePlayer } from './player.js';
+import { updateBots, assignRoles, hearNoise } from './bots.js';
+import {
+  updateReloads, updateProjectiles, updateSmokes, updateBombPickup,
+} from './combat.js';
+import { createEffects } from './effects.js';
+import { createHud } from './hud.js';
+import { ensureAudio, sfx } from './audio.js';
 
-const STEP = 1 / 60;
 const params = new URLSearchParams(location.search);
-const shotMode = params.get('shot');
-const seed = Number(params.get('seed') || '1') || 1;
+const TEST_MODE = params.has('test');
+const SHOT_MODE = params.get('shot');
+const AUTO_MODE = params.has('auto') || TEST_MODE || SHOT_MODE !== null;
+const SHOT_NUM = SHOT_MODE ? parseInt(SHOT_MODE, 10) : 0;
 
-const state = createState(shotMode ? seed : (Date.now() % 2147483647));
-state.shot = shotMode;
+// ------------------------------------------------------------------ errors
+const errors = [];
+window.addEventListener('error', (e) => errors.push(String(e.message || e.error)));
+window.addEventListener('unhandledrejection', (e) => errors.push(String(e.reason)));
 
-// --- renderer, scene, lights -------------------------------------------------
+// ------------------------------------------------------------------ renderer
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.12;
+renderer.toneMappingExposure = 1.05;
 document.getElementById('game').appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(PALETTE.fog, 45, 150);
-const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 400);
+scene.background = new THREE.Color(COLORS.sky);
+scene.fog = new THREE.Fog(COLORS.fog, 45, 130);
 
-// Sky dome: a dusk gradient, cheap and one draw call.
-const skyMat = new THREE.ShaderMaterial({
-  side: THREE.BackSide,
-  depthWrite: false,
-  fog: false,
-  uniforms: { top: { value: new THREE.Color(PALETTE.skyTop) }, bottom: { value: new THREE.Color(PALETTE.skyBottom) } },
-  vertexShader: 'varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
-  fragmentShader: 'varying vec3 vP; uniform vec3 top; uniform vec3 bottom; void main(){ float h = normalize(vP).y * 0.5 + 0.5; gl_FragColor = vec4(mix(bottom, top, smoothstep(0.0, 0.6, h)), 1.0); }',
-});
-scene.add(new THREE.Mesh(new THREE.SphereGeometry(220, 16, 12), skyMat));
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.08, 220);
+camera.rotation.order = 'YXZ';
+scene.add(camera);
 
-const hemi = new THREE.HemisphereLight(PALETTE.hemiSky, PALETTE.hemiGround, 1.0);
+const hemi = new THREE.HemisphereLight(0xdfe8f0, 0x8a7a5c, 0.95);
 scene.add(hemi);
-const sun = new THREE.DirectionalLight(PALETTE.sun, 2.4);
-sun.position.set(-30, 38, -18);
-sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.left = -45; sun.shadow.camera.right = 45;
-sun.shadow.camera.top = 45; sun.shadow.camera.bottom = -45;
-sun.shadow.camera.far = 120;
-sun.shadow.bias = -0.0004;
+const sun = new THREE.DirectionalLight(0xffe0b0, 1.7);
+sun.position.set(24, 34, 12);
 scene.add(sun);
+const fill = new THREE.DirectionalLight(0xbfd0e0, 0.4);
+fill.position.set(-20, 18, -14);
+scene.add(fill);
 
-const world = buildWorld(scene);
-const effects = createEffects(scene);
-const audio = createAudio();
+const world = buildWorld(THREE, COLORS);
+scene.add(world.group);
+const blockers = world.blockers;
+
+// ------------------------------------------------------------------ game state
+let S = createGame();
+startRound(S, SPAWNS);
+assignRoles(S);
+if (TEST_MODE) S.phaseT = 3;
+
+const input = createInput(renderer.domElement);
 const hud = createHud(document);
-const input = createInput(document, renderer.domElement);
-const player = createPlayer(scene, camera, world);
-state.player = player;
+const effects = createEffects(THREE, scene, COLORS);
+const player = playerOf(S);
 
-const ctx = { state, world, scene, camera, renderer, effects, audio, hud, input };
-createBots(ctx); // nine AI fighters: 4 Vanguard allies, 5 Jackals defenders
+// ------------------------------------------------------------------ agents
+const agentMeshes = new Map();
+const tmpV = new THREE.Vector3();
 
-// Bomb charge visual: a small blinking box, shown while planted or dropped.
-const chargeMat = new THREE.MeshBasicMaterial({ color: PALETTE.accent });
-const charge = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.25, 0.3), chargeMat);
-charge.visible = false;
-scene.add(charge);
-const chargeLight = new THREE.PointLight(PALETTE.accent, 0, 8, 1.5);
-scene.add(chargeLight);
-
-// Grenade meshes, one per live grenade entity.
-const grenadeGeo = new THREE.SphereGeometry(0.12, 8, 6);
-const grenadeMat = new THREE.MeshLambertMaterial({ color: 0x22252a });
-function syncGrenadeMeshes() {
-  for (const g of state.entities) {
-    if (g.kind === 'grenade' && !g.mesh) {
-      g.mesh = new THREE.Mesh(grenadeGeo, grenadeMat);
-      g.mesh.position.set(g.x, g.y, g.z);
-      scene.add(g.mesh);
-    }
-  }
+function makeAgentMesh(a) {
+  const g = new THREE.Group();
+  const teamColor = TEAM[a.team].color;
+  const cloth = new THREE.MeshStandardMaterial({ color: teamColor, roughness: 0.85 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x2a2d33, roughness: 0.8 });
+  const skin = new THREE.MeshStandardMaterial({ color: 0xc89878, roughness: 0.9 });
+  const legs = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.55, 0.34), dark);
+  legs.position.y = 0.28;
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.64, 0.75, 0.4), cloth);
+  torso.position.y = 0.93;
+  const vest = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.4, 0.44), dark);
+  vest.position.y = 0.95;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.34, 0.36), skin);
+  head.position.y = 1.56;
+  const helmet = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.16, 0.4), dark);
+  helmet.position.y = 1.72;
+  const gun = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.12, 0.62), dark);
+  gun.position.set(0.28, 1.05, -0.3);
+  g.add(legs, torso, vest, head, helmet, gun);
+  // The bomb rides on the carrier's back.
+  const bombBox = new THREE.Mesh(
+    new THREE.BoxGeometry(0.3, 0.22, 0.14),
+    new THREE.MeshStandardMaterial({ color: 0x1c1e22, roughness: 0.6 }),
+  );
+  bombBox.position.set(0, 1.05, 0.26);
+  bombBox.visible = false;
+  bombBox.name = 'bombBox';
+  g.add(bombBox);
+  scene.add(g);
+  return g;
 }
 
-// --- match / round flow -------------------------------------------------------
-function startMatch() {
-  state.score = { vanguard: 0, jackals: 0 };
-  state.lossStreak = { vanguard: 0, jackals: 0 };
-  state.round = 1;
-  state.money = MATCH.startMoney;
-  state.matchWinner = null;
-  startRound();
+for (const a of S.agents) agentMeshes.set(a.id, makeAgentMesh(a));
+
+// The planted / dropped bomb on the ground, with a blinking light.
+const bombMesh = new THREE.Group();
+const bombBody = new THREE.Mesh(
+  new THREE.BoxGeometry(0.42, 0.26, 0.3),
+  new THREE.MeshStandardMaterial({ color: 0x22242a, roughness: 0.55 }),
+);
+const bombLightMat = new THREE.MeshBasicMaterial({ color: 0xff2a1a });
+const bombLight = new THREE.Mesh(new THREE.SphereGeometry(0.05, 8, 6), bombLightMat);
+bombLight.position.set(0.12, 0.16, 0);
+bombMesh.add(bombBody, bombLight);
+bombMesh.visible = false;
+scene.add(bombMesh);
+
+// ------------------------------------------------------------------ viewmodel
+// The gun in the player's hands: a few boxes parented to the camera, with
+// a bob while walking and a kick when firing. No model files, no network.
+const viewmodel = new THREE.Group();
+const vmGun = new THREE.Group();
+const vmMat = new THREE.MeshStandardMaterial({ color: 0x23262b, roughness: 0.55, metalness: 0.35 });
+const vmAccent = new THREE.MeshStandardMaterial({ color: COLORS.rust, roughness: 0.6 });
+const vmBody = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.13, 0.5), vmMat);
+const vmBarrel = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.3, 8), vmMat);
+vmBarrel.rotation.x = Math.PI / 2;
+vmBarrel.position.set(0, 0.02, -0.38);
+const vmSight = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.06, 0.1), vmAccent);
+vmSight.position.set(0, 0.09, -0.1);
+const vmMag = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.16, 0.08), vmMat);
+vmMag.position.set(0, -0.12, 0.02);
+vmGun.add(vmBody, vmBarrel, vmSight, vmMag);
+const vmNade = new THREE.Mesh(
+  new THREE.SphereGeometry(0.09, 10, 8),
+  new THREE.MeshStandardMaterial({ color: 0x4a5a3a, roughness: 0.7 }),
+);
+vmNade.visible = false;
+viewmodel.add(vmGun, vmNade);
+viewmodel.position.set(0.26, -0.24, -0.42);
+camera.add(viewmodel);
+
+let vmKick = 0;
+let bobT = 0;
+
+// ------------------------------------------------------------------ start screen
+const startScreen = document.getElementById('start-screen');
+const startBtn = document.getElementById('start-btn');
+const restartBtn = document.getElementById('restart-btn');
+let started = false;
+
+function beginPlay() {
+  if (started) return;
+  started = true;
+  ensureAudio();
+  input.requestLock();
+  hud.hideStart();
+}
+startBtn.addEventListener('click', beginPlay);
+renderer.domElement.addEventListener('click', () => {
+  if (started) input.requestLock();
+});
+restartBtn.addEventListener('click', () => {
+  restartMatch();
+});
+if (AUTO_MODE) {
+  started = true;
+  hud.hideStart();
 }
 
-function startRound() {
-  const siteChoice = state.rng() < 0.5 ? 'A' : 'B';
-  state.bomb = { state: 'carried', site: null, x: 0, z: 0, timer: 0, planter: null, defuser: null, progress: 0, carrier: 'player' };
-  state.roundTimeLeft = MATCH.roundTime;
-  state.killfeed = [];
-  state.phase = 'buy';
-  state.phaseT = 0;
-  const spawn = world.spawns.vanguard[4];
-  resetPlayer(player, spawn, player.weaponId || 'longshot');
-  player.carrier = true; // the player carries the charge at round start
-  player.money = state.money;
-  resetBots(ctx, siteChoice);
-  charge.visible = false;
-  hud.hideDeath();
+// The player reference must follow S when the match restarts.
+let livePlayer = player;
+
+function restartMatch() {
+  S = createGame();
+  startRound(S, SPAWNS);
+  assignRoles(S);
+  if (TEST_MODE) S.phaseT = 3;
+  livePlayer = playerOf(S);
+  shotSetupDone = false;
+  deathCam = null;
   hud.hideMatch();
-  hud.setScore(state.score.vanguard, state.score.jackals, state.round);
-  hud.setMoney(state.money);
-  hud.setBomb('PLANT THE CHARGE — SITE A OR B');
-  hud.setPhase('BUY PHASE');
-  hud.showBuy(true);
-  hud.announce(`ROUND ${state.round}`, `Plant the charge at Site ${siteChoice} — ${siteChoice === 'A' ? 'REFINERY' : 'SILO'}`);
-  audio.play('buy');
+  hud.hideStart();
+  started = true;
 }
 
-function endRoundFlow() {
-  if (state.matchWinner) {
-    state.phase = 'matchEnd';
-    state.phaseT = 0;
-    hud.showMatch(state.matchWinner, state.score);
-    document.exitPointerLock?.();
-    return;
-  }
-  state.round += 1;
-  startRound();
-}
-
-// --- player shooting ----------------------------------------------------------
-const _origin = new THREE.Vector3();
-const _dir = new THREE.Vector3();
-let prevFiring = false;
-
-function playerShoot() {
-  const w = WEAPONS[player.weaponId];
-  const shot = tryFire(player, w);
-  if (!shot) return;
-  if (shot.dry) { audio.play('dry'); startReload(player); return; }
-  updateCamera(player);
-  _origin.copy(camera.position);
-  camera.getWorldDirection(_dir);
-  const sp = currentSpread(player, w, groundSpeed(player) > 0.5);
-  _dir.x += (state.rng() - 0.5) * sp * 2;
-  _dir.y += (state.rng() - 0.5) * sp * 2;
-  _dir.z += (state.rng() - 0.5) * sp * 2;
-  _dir.normalize();
-  const hit = resolveShot(ctx, player, _origin, _dir, w);
-  // Muzzle flash at the gun tip.
-  const mx = camera.position.x + _dir.x * 0.7;
-  const my = camera.position.y - 0.12 + _dir.y * 0.7;
-  const mz = camera.position.z + _dir.z * 0.7;
-  effects.spawnMuzzle({ x: mx, y: my, z: mz });
-  audio.play(w.sound);
-  state.noiseEvents.push({ x: player.x, z: player.z, radius: 30, t: 0 });
-}
-
-// --- one fixed simulation step -------------------------------------------------
-function stepSim(dt) {
-  state.time += dt;
-  // Prune old noise.
-  state.noiseEvents = state.noiseEvents.filter(n => { n.t += dt; return n.t < 1.2; });
-
-  if (state.phase === 'menu') return;
-  if (state.phase === 'matchEnd') return;
-
-  if (state.phase === 'buy') {
-    state.phaseT += dt;
-    hud.setTimer(MATCH.buyTime - state.phaseT);
-    hud.setPhase('BUY PHASE');
-    if (state.phaseT >= MATCH.buyTime) {
-      state.phase = 'live';
-      state.phaseT = 0;
-      hud.showBuy(false);
-      hud.announce('GO GO GO', 'Plant the charge or eliminate the Jackals');
-    }
-    return;
-  }
-
-  if (state.phase === 'roundEnd') {
-    state.phaseT += dt;
-    stepBots(ctx, dt);
-    effects.update(dt);
-    if (state.phaseT >= MATCH.roundEndPause) endRoundFlow();
-    return;
-  }
-
-  // Live round.
-  state.phaseT += dt;
-  state.roundTimeLeft -= dt;
-
-  // Bomb timer.
-  if (state.bomb.state === 'planted') {
-    state.bomb.timer -= dt;
-    hud.setBomb(`CHARGE PLANTED — ${Math.ceil(state.bomb.timer)}s`);
-    const blink = Math.sin(state.time * 8) > 0;
-    chargeMat.color.setHex(blink ? PALETTE.accent : 0xff3b30);
-    chargeLight.intensity = blink ? 6 : 0.5;
-    if (state.bomb.timer <= 0) {
-      state.bomb.state = 'detonated';
-      effects.spawnImpact({ x: state.bomb.x, y: 1, z: state.bomb.z }, { x: 0, y: 1, z: 0 }, 30);
-      audio.play('explode');
-      endRound(ctx, 'vanguard', 'CHARGE DETONATED');
-    }
-  }
-
-  if (state.roundTimeLeft <= 0 && state.bomb.state !== 'planted') {
-    endRound(ctx, 'jackals', 'TIME EXPIRED — JACKALS HOLD');
-  }
-
-  // Player look.
-  const { dx, dy } = input.consumeMouse();
-  player.yaw -= dx * 0.0021;
-  player.pitch = Math.max(-1.45, Math.min(1.45, player.pitch - dy * 0.0021));
-
-  // Player movement.
-  stepPlayer(player, { f: input.state.f, r: input.state.r, crouch: input.state.crouch, sprint: input.state.sprint }, dt);
-
-  // Player actions.
-  if (input.state.reload) startReload(player);
-  if (input.state.weaponKey) {
-    const id = input.state.weaponKey;
-    if (WEAPONS[id] && id !== player.weaponId) {
-      // Switching weapons is free; buying is the buy menu's job.
-      const w = WEAPONS[id];
-      player.weaponId = id; player.mag = w.mag; player.reserve = w.reserve;
-      player.reloading = 0; player.fireCooldown = 0;
-    }
-  }
-  const firing = input.state.firing && input.state.locked;
-  const w = WEAPONS[player.weaponId];
-  if (firing && (w.auto || !prevFiring)) playerShoot();
-  prevFiring = firing;
-  if (input.state.grenade) {
-    const kind = input.state.grenade;
-    if (player.grenades[kind] > 0) {
-      player.grenades[kind] -= 1;
-      updateCamera(player);
-      camera.getWorldDirection(_dir);
-      throwGrenade(state, { x: player.x, y: 1.5, z: player.z }, { x: _dir.x, y: _dir.y, z: _dir.z }, kind);
-      audio.play('click');
-    }
-  }
-  // Pick up a dropped charge.
-  if (state.bomb.state === 'dropped' && player.alive) {
-    if (Math.hypot(player.x - state.bomb.x, player.z - state.bomb.z) < 1.4) {
-      state.bomb.state = 'carried';
-      state.bomb.carrier = 'player';
-      player.carrier = true;
-      hud.announce('CHARGE RECOVERED', 'Plant it at a site');
-    }
-  }
-  // Plant: hold E at a site while carrying.
-  if (state.bomb.state === 'carried' && state.bomb.carrier === 'player' && player.alive) {
-    const siteKey = state.bomb.site;
-    const site = world.sites[siteKey || (player.z < 0 ? 'A' : 'B')];
-    const inSite = Math.hypot(player.x - site.x, player.z - site.z) < site.r;
-    if (inSite && input.isInteracting()) {
-      state.bomb.progress += dt;
-      state.bomb.site = player.z < 0 ? 'A' : 'B';
-      hud.setBomb(`PLANTING… ${Math.ceil((MATCH.plantTime - state.bomb.progress) * 10) / 10}s`);
-      if (state.bomb.progress >= MATCH.plantTime) {
-        state.bomb.state = 'planted';
-        state.bomb.x = site.x; state.bomb.z = site.z;
-        state.bomb.timer = MATCH.bombTimer;
-        player.carrier = false;
-        state.plants += 1;
-        state.money += ECONOMY.plant;
-        charge.position.set(site.x, 0.3, site.z);
-        charge.visible = true;
-        chargeLight.position.set(site.x, 1, site.z);
-        hud.announce('CHARGE PLANTED', `Site ${state.bomb.site} — defend it for ${MATCH.bombTimer}s`);
-        audio.play('plant');
+// ------------------------------------------------------------------ events
+// The sim emits; this drains each tick into sound, effects and the HUD.
+function drainEvents() {
+  for (const e of S.events) {
+    const p = livePlayer;
+    const pEye = { x: p.pos.x, y: p.pos.y + 1.62, z: p.pos.z };
+    const distTo = (x, y, z) => Math.hypot(x - pEye.x, y - pEye.y, z - pEye.z);
+    switch (e.type) {
+      case 'shot': {
+        sfx.shot(e.weapon, distTo(e.x, e.y, e.z));
+        if (e.agent === 0) {
+          vmKick = 0.06;
+          tmpV.set(0.26, -0.16, -0.85);
+          camera.localToWorld(tmpV);
+          effects.spawnMuzzle(tmpV.x, tmpV.y, tmpV.z);
+        }
+        break;
       }
-    } else {
-      state.bomb.progress = Math.max(0, state.bomb.progress - dt);
+      case 'tracer':
+        effects.spawnTracer(e.x0, e.y0, e.z0, e.x1, e.y1, e.z1, e.color);
+        break;
+      case 'impact':
+        effects.spawnImpact(e.x, e.y, e.z);
+        break;
+      case 'hit':
+        if (e.agent === 0) {
+          hud.hitmarker(e.head);
+          sfx.hit(e.head);
+        }
+        if (e.target === 0) {
+          hud.damageFlash();
+          sfx.hurt();
+        }
+        break;
+      case 'kill':
+        hud.killfeed(e.killerName + ' ✕ ' + e.victimName + (e.head ? ' — headshot' : ''), e.killer === 0 ? 'good' : e.victim === 0 ? 'bad' : '');
+        if (e.killer === 0) sfx.kill();
+        break;
+      case 'noise':
+        hearNoise(S, e.x, e.z, e.radius);
+        break;
+      case 'reload':
+        if (e.agent === 0) sfx.reload();
+        break;
+      case 'dry':
+        if (e.agent === 0) sfx.dry();
+        break;
+      case 'throw':
+        if (e.agent === 0) sfx.throw_();
+        break;
+      case 'explode':
+        effects.spawnExplosion(e.x, e.y, e.z);
+        sfx.explode(distTo(e.x, e.y, e.z));
+        break;
+      case 'planted':
+        hud.banner('BOMB PLANTED — SITE ' + e.site, 'Jackals must defuse — Vanguard hold the site', 4);
+        sfx.plant();
+        break;
+      case 'defused':
+        hud.banner('BOMB DEFUSED', '', 3);
+        sfx.defuse();
+        break;
+      case 'bombDrop':
+        hud.killfeed('The bomb was dropped', '');
+        break;
+      case 'bombPickup': {
+        const a = S.agents[e.agent];
+        hud.killfeed((a ? a.name : 'Someone') + ' picked up the bomb', '');
+        break;
+      }
+      case 'buy':
+        if (e.agent === 0) sfx.buy();
+        break;
+      case 'roundStart':
+        hud.banner('ROUND ' + e.round, 'Buy phase — press B, buy with 1–6, then push a site', 3.5);
+        break;
+      case 'roundEnd': {
+        const name = e.winner === 'V' ? 'Vanguard' : 'Jackals';
+        hud.banner(name + ' take Round ' + e.round, e.reason, 4);
+        if (e.winner === 'V') sfx.roundWin();
+        else sfx.roundLose();
+        break;
+      }
+      case 'matchEnd':
+        hud.showMatch(S.matchWinner, S.score.V, S.score.J);
+        break;
+      default:
+        break;
     }
   }
-
-  stepBots(ctx, dt);
-  stepGrenades(ctx, dt);
-  syncGrenadeMeshes();
-  effects.update(dt);
-
-  // Charge visual follows a dropped charge.
-  if (state.bomb.state === 'dropped') {
-    charge.position.set(state.bomb.x, 0.3, state.bomb.z);
-    charge.visible = true;
-    chargeLight.position.set(state.bomb.x, 1, state.bomb.z);
-    chargeLight.intensity = 2;
-  } else if (state.bomb.state !== 'planted') {
-    charge.visible = false;
-    chargeLight.intensity = 0;
-  }
-
-  if (input.state.buy && state.phase === 'live') {
-    hud.showBuy(true);
-    state.buyOpen = true;
-  }
-  input.clearOneShots();
+  S.events.length = 0;
 }
 
-// --- HUD sync (every render) ----------------------------------------------------
-function syncHud() {
-  const w = WEAPONS[player.weaponId];
-  hud.setHealth(player.hp);
-  hud.setAmmo(player.mag, player.reserve, player.reloading > 0);
-  hud.setWeapon(w.name);
-  hud.setMoney(state.money);
-  hud.setScore(state.score.vanguard, state.score.jackals, state.round);
-  if (state.phase === 'live') {
-    hud.setTimer(state.roundTimeLeft);
-    hud.setPhase(state.bomb.state === 'planted' ? 'CHARGE LIVE' : 'ROUND');
-  } else if (state.phase === 'roundEnd') {
-    hud.setTimer(state.roundTimeLeft);
-    hud.setPhase('ROUND END');
+// ------------------------------------------------------------------ sim step
+let shotSetupDone = false;
+let lastBeepSecond = -1;
+
+function applyShotPreset(n) {
+  const p = livePlayer;
+  // Shots 2–4 play live with a rifle in hand.
+  if (n >= 2) {
+    p.primary = 'rifle';
+    p.weapon = 'rifle';
+    p.mag = 30;
+    p.reserve = 90;
+    if (S.phase === 'buy') {
+      S.phase = 'live';
+      S.phaseT = ROUND_TIME;
+    }
   }
-  const sp = currentSpread(player, w, groundSpeed(player) > 0.5);
-  hud.setSpread(4 + sp * 900);
-  hud.refreshKillfeed(state.killfeed);
-  if (!player.alive) hud.setHealth(0);
+  if (n === 2) {
+    p.pos.x = -8;
+    p.pos.z = 0;
+    p.yaw = -Math.PI / 2; // face east, down mid lane
+  } else if (n === 3) {
+    p.pos.x = 17;
+    p.pos.z = -11;
+    p.yaw = Math.atan2(-(24 - 17), -(-14 + 11)); // face Site A
+    // Teleport the real bomb carrier (whoever startRound picked) onto the
+    // site so the plant goes through the real plant code.
+    const carrier = S.agents.find((a) => a.hasBomb) || S.agents[1];
+    carrier.pos.x = SITES.A.x;
+    carrier.pos.z = SITES.A.z;
+    carrier.path = [];
+    carrier.role = 'plant';
+    carrier.thinkT = 0;
+    // Clear all defenders far west, out of the carrier's sight, so the
+    // plant goes through the real plant code and the rotate-back fight
+    // happens on camera.
+    for (const a of S.agents) {
+      if (a.team === 'J' && a.bot && a.alive) {
+        a.pos.x = -16 + (a.id % 3) * 4;
+        a.pos.z = a.id % 2 === 0 ? -8 : 8;
+        a.path = [];
+        a.role = 'hold';
+        a.holdNode = 11;
+      }
+    }
+  } else if (n === 4) {
+    p.pos.x = 14;
+    p.pos.z = 2;
+    p.yaw = Math.atan2(-(24 - 14), -(14 - 2)); // face Site B over the crates
+    S.smokes.push({ x: SITES.B.x, y: 1.1, z: SITES.B.z, r: 4.5, ttl: 16 });
+  }
 }
 
-// --- render loop ------------------------------------------------------------------
-let last = performance.now();
+function autopilot() {
+  const p = livePlayer;
+  if (!p.alive) return;
+  // Find the nearest enemy the player can see.
+  let best = null;
+  let bestD = Infinity;
+  for (const a of S.agents) {
+    if (!a.alive || a.team === p.team) continue;
+    const d = Math.hypot(a.pos.x - p.pos.x, a.pos.z - p.pos.z);
+    if (d < bestD) {
+      bestD = d;
+      best = a;
+    }
+  }
+  let wantYaw;
+  if (best && bestD < 45) {
+    wantYaw = Math.atan2(-(best.pos.x - p.pos.x), -(best.pos.z - p.pos.z));
+  } else {
+    wantYaw = -Math.PI / 2; // watch east, down the map
+  }
+  let dyaw = wantYaw - p.yaw;
+  while (dyaw > Math.PI) dyaw -= Math.PI * 2;
+  while (dyaw < -Math.PI) dyaw += Math.PI * 2;
+  input.mouseDX += Math.max(-500, Math.min(500, dyaw / 0.0022));
+  // Hold the vantage: strafe side to side instead of walking into walls
+  // and enemy fire, and crouch when an enemy is in sight.
+  input.keys.delete('KeyW');
+  const strafeRight = Math.floor(S.time / 1.2) % 2 === 0;
+  input.keys.delete(strafeRight ? 'KeyA' : 'KeyD');
+  input.keys.add(strafeRight ? 'KeyD' : 'KeyA');
+  if (best && bestD < 45) input.keys.add('ControlLeft');
+  else input.keys.delete('ControlLeft');
+  input.firing = !!best && bestD < 45;
+}
+
+function stepSim(dt) {
+  S.time += dt;
+  if (SHOT_MODE && !shotSetupDone && S.time > 1.5) {
+    shotSetupDone = true;
+    applyShotPreset(SHOT_NUM);
+  }
+
+  if (S.phase === 'buy') {
+    S.phaseT -= dt;
+    // Buy phase is still movement time: walk out of spawn, shop, get set.
+    updatePlayer(S, livePlayer, input, dt, blockers, hud);
+    updateBots(S, dt, blockers);
+    updateReloads(S, dt);
+    if (S.phaseT <= 0) {
+      S.phase = 'live';
+      S.phaseT = TEST_MODE ? 25 : ROUND_TIME;
+      hud.banner('GO — ROUND ' + S.round, 'Plant the bomb or eliminate the Jackals', 2.5);
+    }
+  } else if (S.phase === 'live') {
+    S.phaseT -= dt;
+    if (S.bomb.state === 'planted') {
+      S.bomb.timer -= dt;
+      const sec = Math.ceil(S.bomb.timer);
+      if (sec !== lastBeepSecond) {
+        lastBeepSecond = sec;
+        sfx.beep();
+      }
+      if (S.bomb.timer <= 0) {
+        // Detonation: the blast first, the verdict right after.
+        S.events.push({ type: 'explode', x: S.bomb.pos.x, y: 1, z: S.bomb.pos.z });
+        S.bomb.state = 'exploded';
+        endRound(S, 'V', 'Bomb detonated at Site ' + S.bomb.site);
+      }
+    }
+    if (SHOT_MODE) autopilot();
+    updatePlayer(S, livePlayer, input, dt, blockers, hud);
+    updateBots(S, dt, blockers);
+    updateReloads(S, dt);
+    updateProjectiles(S, dt, blockers);
+    updateSmokes(S, dt);
+    updateBombPickup(S);
+    // The bomb's fate decides the round once it is planted or defused.
+    if (S.bomb.state === 'defused') {
+      endRound(S, 'J', 'Bomb defused at Site ' + S.bomb.site);
+    } else {
+      const over = checkRoundEnd(S);
+      if (over) endRound(S, over.winner, over.reason);
+    }
+  } else if (S.phase === 'end') {
+    S.phaseT -= dt;
+    updateSmokes(S, dt);
+    if (S.phaseT <= 0) {
+      S.round++;
+      startRound(S, SPAWNS);
+      assignRoles(S);
+      if (TEST_MODE) S.phaseT = 3;
+    }
+  }
+  // 'match' phase: frozen until the player restarts.
+
+  drainEvents();
+  input.endTick();
+}
+
+// ------------------------------------------------------------------ render sync
+let deathCam = null;
+
+function syncRender(frameDt) {
+  const p = livePlayer;
+  for (const a of S.agents) {
+    const m = agentMeshes.get(a.id);
+    if (!m) continue;
+    if (a.id === 0) {
+      m.visible = false; // first person: your own body is the viewmodel
+      continue;
+    }
+    m.visible = true;
+    m.position.set(a.pos.x, a.pos.y, a.pos.z);
+    m.rotation.y = a.yaw;
+    if (a.alive) {
+      m.rotation.z = 0;
+      m.scale.y = a.crouch ? 0.72 : 1;
+    } else {
+      m.rotation.z = Math.PI / 2; // fallen
+      m.position.y = 0.35;
+      m.scale.y = 1;
+    }
+    const bb = m.getObjectByName('bombBox');
+    if (bb) bb.visible = a.hasBomb;
+  }
+
+  // Bomb on the ground.
+  if ((S.bomb.state === 'dropped' || S.bomb.state === 'planted') && S.bomb.pos) {
+    bombMesh.visible = true;
+    bombMesh.position.set(S.bomb.pos.x, 0.14, S.bomb.pos.z);
+    bombLightMat.color.setHex(S.bomb.state === 'planted' && Math.sin(S.time * 8) > 0 ? 0xff2a1a : 0x551008);
+  } else {
+    bombMesh.visible = false;
+  }
+
+  // Camera: your eyes. When you die, the camera stays where you fell,
+  // looking where you were looking — a death cam, not a wall-staring bot.
+  if (p.alive) {
+    deathCam = null;
+    const eyeH = p.crouch ? 1.15 : 1.62;
+    camera.position.set(p.pos.x, p.pos.y + eyeH, p.pos.z);
+    camera.rotation.y = p.yaw;
+    camera.rotation.x = p.pitch;
+  } else {
+    if (!deathCam) {
+      // In shot 4 the subject is the smoke at Site B: keep the camera
+      // on it even after the player falls.
+      let yaw = p.yaw;
+      let pitch = p.pitch;
+      if (SHOT_NUM === 4) {
+        yaw = Math.atan2(-(SITES.B.x - p.pos.x), -(SITES.B.z - p.pos.z));
+        pitch = 0;
+      }
+      deathCam = { x: p.pos.x, y: p.pos.y + 1.62, z: p.pos.z, yaw, pitch };
+    }
+    camera.position.set(deathCam.x, deathCam.y, deathCam.z);
+    camera.rotation.y = deathCam.yaw;
+    camera.rotation.x = deathCam.pitch;
+  }
+
+  // Viewmodel: bob with the stride, kick with the shot.
+  vmKick = Math.max(0, vmKick - frameDt * 0.4);
+  const speed = Math.hypot(p.vel.x, p.vel.z);
+  if (p.moving && p.alive) bobT += frameDt * speed * 1.6;
+  viewmodel.position.set(
+    0.26 + Math.sin(bobT * 2) * 0.006,
+    -0.24 + Math.abs(Math.sin(bobT * 2)) * 0.012,
+    -0.42 + vmKick,
+  );
+  vmGun.visible = p.weapon !== 'smoke' && p.weapon !== 'frag';
+  vmNade.visible = p.weapon === 'smoke' || p.weapon === 'frag';
+
+  effects.syncSmokes(S.smokes);
+  effects.update(frameDt);
+  hud.update(S, p, frameDt);
+}
+
+// ------------------------------------------------------------------ main loop
+let lastT = performance.now();
 let acc = 0;
 
 function frame(now) {
   requestAnimationFrame(frame);
-  const dt = Math.min(0.1, (now - last) / 1000);
-  last = now;
-  if (!state.shot) {
-    acc += dt;
-    let n = 0;
-    while (acc >= STEP && n < 5) { stepSim(STEP); acc -= STEP; n += 1; }
-    if (n === 5) acc = 0;
+  let frameDt = (now - lastT) / 1000;
+  lastT = now;
+  if (frameDt > 0.25) frameDt = 0.25;
+  if (started && S.phase !== 'match') {
+    acc += frameDt;
+    let steps = 0;
+    while (acc >= DT && steps < 5) {
+      stepSim(DT);
+      acc -= DT;
+      steps++;
+    }
+    if (steps === 5) acc = 0; // spiral guard: never fall behind forever
   }
-  updateCamera(player);
-  syncHud();
+  syncRender(frameDt);
   renderer.render(scene, camera);
 }
 
-// --- buy menu wiring ---------------------------------------------------------------
-document.querySelectorAll('[data-buy]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const [kind, id] = btn.dataset.buy.split(':');
-    if (state.phase !== 'buy' && state.phase !== 'live') return;
-    if (kind === 'weapon' && buyWeapon(state, id)) audio.play('buy');
-    if (kind === 'grenade' && buyGrenade(state, id)) audio.play('buy');
-    hud.setMoney(state.money);
-    hud.setBuyMoney(state.money);
-  });
-});
-document.getElementById('buy-close')?.addEventListener('click', () => hud.showBuy(false));
-document.getElementById('start-btn')?.addEventListener('click', () => {
-  audio.unlock();
-  hud.showStart(false);
-  renderer.domElement.requestPointerLock?.();
-  startMatch();
-});
-document.getElementById('restart-btn')?.addEventListener('click', () => {
-  hud.hideMatch();
-  startMatch();
-});
-addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight;
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-});
-addEventListener('keydown', (e) => {
-  if (e.code === 'KeyR' && state.phase === 'matchEnd') { hud.hideMatch(); startMatch(); }
-  if (e.code === 'KeyM') audio.toggle();
+  renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// --- deterministic screenshot staging (?shot=start|fight|site|end) ------------------
-function stageShot(mode) {
-  // A match in progress, staged so the frame reads at a glance.
-  startMatch();
-  // Drop the stale round-start announce startMatch() raised; the 'start' and
-  // 'site' shots set their own announce in their branches below.
-  document.getElementById('announce')?.classList.remove('on');
-  state.phase = 'live';
-  state.phaseT = 10;
-  hud.showBuy(false);
-  const allies = state.bots.filter(b => b.team === 'vanguard');
-  const enemies = state.bots.filter(b => b.team === 'jackals');
-
-  if (mode === 'start') {
-    state.roundTimeLeft = 98;
-    state.score = { vanguard: 0, jackals: 0 };
-    player.x = -27; player.z = 0; player.yaw = -Math.PI / 2; player.pitch = 0;
-    allies[0].x = -24; allies[0].z = -2; allies[0].yaw = -Math.PI / 2;
-    allies[1].x = -24; allies[1].z = 3; allies[1].yaw = -Math.PI / 2;
-    enemies[0].x = 8; enemies[0].z = -1; enemies[0].yaw = Math.PI / 2;
-    hud.announce('ROUND 1', 'Plant the charge at Site A — REFINERY');
-  } else if (mode === 'fight') {
-    state.roundTimeLeft = 61;
-    state.score = { vanguard: 1, jackals: 1 };
-    state.round = 3;
-    state.money = 2650;
-    player.x = -4; player.z = 2; player.yaw = -Math.PI / 2 + 0.12; player.pitch = 0.01;
-    player.hp = 82; player.mag = 24; player.reserve = 90;
-    const e = enemies[0];
-    e.x = 9; e.z = 1.5; e.yaw = Math.PI / 2; e.alive = true;
-    e.mesh.position.set(e.x, 0, e.z);
-    allies[0].x = -8; allies[0].z = 5; allies[0].yaw = -Math.PI / 2;
-    state.killfeed.unshift({ text: 'YOU  ✕  FANG', t: 0 });
-    state.killfeed.unshift({ text: 'ROOK  ✕  VEX', t: 0 });
-    hud.setBomb('PLANT THE CHARGE — SITE A');
-  } else if (mode === 'site') {
-    state.roundTimeLeft = 32;
-    state.score = { vanguard: 2, jackals: 2 };
-    state.round = 5;
-    state.money = 4100;
-    state.bomb.state = 'planted';
-    state.bomb.site = 'B';
-    state.bomb.x = 20; state.bomb.z = 15; state.bomb.timer = 32;
-    charge.position.set(20, 0.3, 15);
-    charge.visible = true;
-    chargeLight.position.set(20, 1, 15);
-    chargeLight.intensity = 6;
-    player.x = 12; player.z = 12; player.yaw = -Math.PI / 2 - 0.5; player.pitch = 0;
-    player.hp = 64; player.mag = 18; player.reserve = 60;
-    // The defuser, crouched on the charge at the edge of the smoke — visible.
-    const d = enemies[1];
-    d.x = 21.5; d.z = 16.5; d.yaw = Math.PI / 2; d.alive = true;
-    d.mesh.position.set(d.x, 0, d.z);
-    effects.spawnSmoke(17, 12.5, 5, 14);
-    hud.setBomb('CHARGE PLANTED — 32s');
-    hud.announce('CHARGE PLANTED', 'Site B — SILO — hold the line');
-  } else if (mode === 'end') {
-    state.phase = 'roundEnd';
-    state.phaseT = 1;
-    state.score = { vanguard: 3, jackals: 2 };
-    state.round = 6;
-    state.winner = 'vanguard';
-    player.x = -4; player.z = -3; player.yaw = -1.1; player.pitch = 0;
-    player.hp = 45; player.mag = 7; player.reserve = 30;
-    state.killfeed.unshift({ text: 'YOU  ✕  DUNE  (HEADSHOT)', t: 0 });
-    state.killfeed.unshift({ text: 'YOU  ✕  MIRAGE', t: 0 });
-    state.killfeed.unshift({ text: 'HAVOC  ✕  GHOST', t: 0 });
-    hud.showBanner('ROUND WON', 'JACKALS ELIMINATED');
-    hud.setBomb('ROUND WON');
-  }
-  // Settle a few fixed steps so bots stand where the frame expects them, then
-  // dress the frame (tracer, muzzle flash, hitmarker) LAST — their lifetimes are
-  // ~0.1 s, so anything spawned before the settle would already have faded.
-  for (let i = 0; i < 6; i++) stepSim(STEP);
-  if (mode === 'fight') {
-    updateCamera(player);
-    effects.spawnTracer({ x: player.x + 0.3, y: 1.5, z: player.z }, { x: 8.6, y: 1.4, z: 1.5 }, 0xffe9a8);
-    effects.spawnMuzzle({ x: player.x + 0.4, y: 1.45, z: player.z - 0.5 });
-    document.getElementById('hitmarker')?.classList.add('on');
-  }
-  updateCamera(player);
-  syncHud();
-  renderer.render(scene, camera);
-  renderer.render(scene, camera);
-  window.__shotReady = true;
-}
-
-// Debug hook for play-testing (and the finalist review): the live state, read-only
-// from the console, plus a manual stepper that advances the fixed-step simulation
-// without waiting on requestAnimationFrame (headless renderers throttle it).
-// Harmless in production play.
-window.__dustline = {
-  state, player,
-  advance(seconds) {
-    const n = Math.max(0, Math.round(seconds / STEP));
-    for (let i = 0; i < n; i++) stepSim(STEP);
-    updateCamera(player);
-    syncHud();
-    renderer.render(scene, camera);
-    return { phase: state.phase, round: state.round, timeLeft: state.roundTimeLeft, score: { ...state.score }, bomb: state.bomb.state };
+// Debug hook for the automated playtest: state, errors, and the facts the
+// test asserts (shots fired, rounds turning over).
+window.__DUSTLINE = {
+  get state() {
+    return S;
+  },
+  get errors() {
+    return errors;
+  },
+  get shots() {
+    return S.shotCount;
+  },
+  get round() {
+    return S.round;
+  },
+  get phase() {
+    return S.phase;
+  },
+  get score() {
+    return { V: S.score.V, J: S.score.J };
   },
 };
 
-if (shotMode) {
-  hud.showStart(false);
-  stageShot(shotMode);
-} else {
-  hud.showStart(true);
-  hud.setPhase('MENU');
-  requestAnimationFrame(frame);
-}
+requestAnimationFrame(frame);
+

@@ -1,148 +1,190 @@
-// DUSTLINE — the player: first-person movement with acceleration, crouching and
-// AABB collision, plus the view model (gun) the camera carries. One fixed-step
-// update; the render loop only reads the camera it writes.
-import * as THREE from 'three';
-import { WEAPONS } from './state.js';
+// player.js — the human on Vanguard. Acceleration-based movement with
+// crouching, mouse look with recoil, weapon slots, the buy menu and the
+// plant/defuse key. Everything here runs inside the fixed 60 Hz tick.
 
-const EYE_STAND = 1.62;
-const EYE_CROUCH = 1.12;
-const RADIUS = 0.42;
-const WALK_SPEED = 5.2;
+import { weaponDef, WEAPONS, GRENADES, BUY_MENU } from './weapons.js';
+import { shoot, startReload, throwGrenade, updateObjective } from './combat.js';
+import { collideMove, pointInSite } from './world.js';
+import { emit } from './state.js';
+
+const WALK_SPEED = 5.0;
 const CROUCH_SPEED = 2.6;
+const WALK_SLOW_SPEED = 2.8; // Shift: slow, accurate, quiet
 const ACCEL = 42;
-const FRICTION = 10;
+const FRICTION = 11;
+const MOUSE_SENS = 0.0022;
 
-export function createPlayer(scene, camera, world) {
-  // View model: a simple rifle built from boxes, parented to the camera.
-  const gunMat = new THREE.MeshLambertMaterial({ color: 0x2b2f36 });
-  const gunWood = new THREE.MeshLambertMaterial({ color: 0x6b4f26 });
-  const gun = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.13, 0.62), gunMat);
-  body.position.set(0, -0.02, -0.1);
-  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.34, 8), gunMat);
-  barrel.rotation.x = Math.PI / 2;
-  barrel.position.set(0, 0.01, -0.55);
-  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.16, 0.1), gunWood);
-  grip.position.set(0, -0.1, 0.08);
-  const sight = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.05, 0.12), gunMat);
-  sight.position.set(0, 0.08, -0.18);
-  gun.add(body, barrel, grip, sight);
-  gun.position.set(0.26, -0.24, -0.42);
-  camera.add(gun);
-  scene.add(camera);
-
-  return {
-    team: 'vanguard',   // the player always fights for Vanguard (the attackers)
-    x: -28, z: 0, y: 0,
-    vx: 0, vz: 0,
-    yaw: -Math.PI / 2,   // facing east, down mid
-    pitch: 0,
-    hp: 100,
-    alive: true,
-    crouched: false,
-    onGround: true,
-    carrier: false,       // true while carrying the charge
-    weaponId: 'longshot',
-    mag: 30, reserve: 90,
-    reloading: 0,         // seconds left, 0 = not reloading
-    fireCooldown: 0,
-    bloom: 0,             // accumulated spread from firing
-    recoilPitch: 0,       // unrecovered recoil, decays back to 0
-    grenades: { popper: 0, veil: 0 },
-    money: 800,
-    kills: 0,
-    lastDamageFrom: null,
-    camera, gun, world,
-  };
-}
-
-export function resetPlayer(p, spawn, weaponId) {
-  p.x = spawn[0]; p.z = spawn[1];
-  p.vx = 0; p.vz = 0;
-  p.yaw = -Math.PI / 2; p.pitch = 0;
-  p.hp = 100; p.alive = true; p.crouched = false;
-  p.carrier = false;
-  const w = WEAPONS[weaponId];
-  p.weaponId = weaponId; p.mag = w.mag; p.reserve = w.reserve;
-  p.reloading = 0; p.fireCooldown = 0; p.bloom = 0; p.recoilPitch = 0;
-  p.lastDamageFrom = null;
-}
-
-// Resolve XZ movement against AABB colliders, axis by axis, so the player slides
-// along walls instead of sticking. Only colliders taller than the player's feet
-// block; low props (site markers) never do.
-function moveAxis(p, world, dx, dz) {
-  const c = world.colliders;
-  // X axis
-  let nx = p.x + dx;
-  for (let i = 0; i < c.length; i++) {
-    const b = c[i];
-    if (b.top < 0.2) continue;
-    if (nx + RADIUS > b.minX && nx - RADIUS < b.maxX && p.z + RADIUS > b.minZ && p.z - RADIUS < b.maxZ) {
-      nx = dx > 0 ? b.minX - RADIUS : b.maxX + RADIUS;
-    }
+// Buying: returns true when the purchase went through.
+export function tryBuy(S, p, itemId) {
+  if (S.phase !== 'buy') return false;
+  const gun = WEAPONS[itemId];
+  if (gun) {
+    if (p.money < gun.price) return false;
+    if (p.primary === itemId) return false; // already own it
+    p.money -= gun.price;
+    p.primary = itemId;
+    p.weapon = itemId;
+    p.mag = gun.mag;
+    p.reserve = gun.reserve;
+    p.reloading = false;
+    emit(S, 'buy', { agent: p.id, item: itemId });
+    return true;
   }
-  p.x = Math.max(world.bounds.minX + RADIUS, Math.min(world.bounds.maxX - RADIUS, nx));
-  // Z axis
-  let nz = p.z + dz;
-  for (let i = 0; i < c.length; i++) {
-    const b = c[i];
-    if (b.top < 0.2) continue;
-    if (p.x + RADIUS > b.minX && p.x - RADIUS < b.maxX && nz + RADIUS > b.minZ && nz - RADIUS < b.maxZ) {
-      nz = dz > 0 ? b.minZ - RADIUS : b.maxZ + RADIUS;
-    }
+  const nade = GRENADES[itemId];
+  if (nade) {
+    if (p.money < nade.price) return false;
+    if (p.grenades[itemId] >= 2) return false; // two of each at most
+    p.money -= nade.price;
+    p.grenades[itemId]++;
+    emit(S, 'buy', { agent: p.id, item: itemId });
+    return true;
   }
-  p.z = Math.max(world.bounds.minZ + RADIUS, Math.min(world.bounds.maxZ - RADIUS, nz));
+  return false;
 }
 
-// One fixed step (dt = 1/60). input: {f, r, crouch, sprint} in -1..1.
-export function stepPlayer(p, input, dt) {
+export function updatePlayer(S, p, input, dt, blockers, hud) {
   if (!p.alive) return;
-  const speed = p.crouched ? CROUCH_SPEED : WALK_SPEED;
-  const sin = Math.sin(p.yaw), cos = Math.cos(p.yaw);
+  const mouse = input.consumeMouse();
+
+  // --- look ---
+  p.yaw -= mouse.dx * MOUSE_SENS;
+  p.pitch -= mouse.dy * MOUSE_SENS;
+  // Recoil pulls the view up and settles back down.
+  p.pitch += p.recoil * 0.35;
+  p.recoil = Math.max(0, p.recoil - dt * 0.25);
+  const pitchMax = 1.45;
+  p.pitch = Math.max(-pitchMax, Math.min(pitchMax, p.pitch));
+  p.bloom = Math.max(0, p.bloom - dt * 0.05);
+
+  // --- move ---
+  const fwd = (input.isDown('forward') ? 1 : 0) - (input.isDown('back') ? 1 : 0);
+  const strafe = (input.isDown('right') ? 1 : 0) - (input.isDown('left') ? 1 : 0);
+  p.crouch = input.isDown('crouch');
+  const slow = input.isDown('walk');
+  const maxSpeed = p.crouch ? CROUCH_SPEED : slow ? WALK_SLOW_SPEED : WALK_SPEED;
+  const sin = Math.sin(p.yaw);
+  const cos = Math.cos(p.yaw);
   // Forward is -Z rotated by yaw; right is +X rotated by yaw.
-  const fx = -sin, fz = -cos, rx = cos, rz = -sin;
-  let mx = fx * input.f + rx * input.r;
-  let mz = fz * input.f + rz * input.r;
-  const len = Math.hypot(mx, mz);
-  if (len > 1) { mx /= len; mz /= len; }
-  p.vx += mx * ACCEL * dt;
-  p.vz += mz * ACCEL * dt;
-  // Friction when no input; clamp to top speed.
-  const fr = Math.max(0, 1 - FRICTION * dt);
-  if (len < 0.05) { p.vx *= fr; p.vz *= fr; }
-  const sp = Math.hypot(p.vx, p.vz);
-  if (sp > speed) { p.vx *= speed / sp; p.vz *= speed / sp; }
-  moveAxis(p, p.world, p.vx * dt, p.vz * dt);
-  // Recoil recovers; bloom decays; reload and fire timers tick.
-  p.recoilPitch *= Math.max(0, 1 - 6 * dt);
-  p.bloom = Math.max(0, p.bloom - 0.02 * dt);
-  if (p.reloading > 0) {
-    p.reloading -= dt;
-    if (p.reloading <= 0) {
-      const w = WEAPONS[p.weaponId];
-      const need = w.mag - p.mag;
-      const take = Math.min(need, p.reserve);
-      p.mag += take; p.reserve -= take;
-      p.reloading = 0;
+  let mx = -sin * fwd + cos * strafe;
+  let mz = -cos * fwd - sin * strafe;
+  const mLen = Math.hypot(mx, mz);
+  if (mLen > 0) {
+    mx /= mLen;
+    mz /= mLen;
+  }
+  const frozen = false; // buy phase still lets you move around spawn
+  if (!frozen && mLen > 0) {
+    p.vel.x += mx * ACCEL * dt;
+    p.vel.z += mz * ACCEL * dt;
+    const vLen = Math.hypot(p.vel.x, p.vel.z);
+    if (vLen > maxSpeed) {
+      p.vel.x = (p.vel.x / vLen) * maxSpeed;
+      p.vel.z = (p.vel.z / vLen) * maxSpeed;
+    }
+  } else {
+    // Friction stops you; stopping to aim pays.
+    const vLen = Math.hypot(p.vel.x, p.vel.z);
+    if (vLen > 0) {
+      const drop = Math.min(vLen, FRICTION * dt * (p.crouch ? 1.6 : 1));
+      p.vel.x -= (p.vel.x / vLen) * drop;
+      p.vel.z -= (p.vel.z / vLen) * drop;
     }
   }
-  if (p.fireCooldown > 0) p.fireCooldown -= dt;
+  p.moving = Math.hypot(p.vel.x, p.vel.z) > 0.4;
+  collideMove(p.pos, 0.35, p.vel.x * dt, p.vel.z * dt, blockers);
+
+  // --- weapon slots ---
+  if (input.wasPressed('slot1')) selectWeapon(S, p, 'pistol');
+  if (input.wasPressed('slot2') && p.primary === 'rifle') selectWeapon(S, p, 'rifle');
+  if (input.wasPressed('slot3') && p.primary === 'shotgun') selectWeapon(S, p, 'shotgun');
+  if (input.wasPressed('slot4') && p.primary === 'dmr') selectWeapon(S, p, 'dmr');
+  if (input.wasPressed('slot5') && p.grenades.smoke > 0) selectWeapon(S, p, 'smoke');
+  if (input.wasPressed('slot6') && p.grenades.frag > 0) selectWeapon(S, p, 'frag');
+
+  // --- buy menu keys (only during the buy phase) ---
+  if (S.phase === 'buy') {
+    for (const item of BUY_MENU) {
+      if (input.wasPressed('slot' + item.key)) tryBuy(S, p, item.id);
+    }
+  }
+
+  // --- fire / reload ---
+  if (p.fireCd > 0) p.fireCd -= dt;
+  const def = weaponDef(p.weapon);
+  if (p.weapon === 'smoke' || p.weapon === 'frag') {
+    if (input.firing) {
+      if (throwGrenade(S, p, p.weapon)) {
+        selectWeapon(S, p, p.primary || 'pistol');
+      }
+      input.firing = false; // one throw per click
+    }
+  } else if (input.firing && S.phase === 'live') {
+    if (def.auto) {
+      shoot(S, p, blockers);
+    } else if (!p._firedThisClick) {
+      shoot(S, p, blockers);
+      p._firedThisClick = true;
+    }
+  }
+  if (!input.firing) p._firedThisClick = false;
+  if (input.wasPressed('reload')) startReload(S, p);
+
+  // --- plant / defuse: hold E ---
+  const useHeld = input.isDown('use');
+  if (useHeld && S.phase === 'live') {
+    if (p.hasBomb && (pointInSite('A', p.pos.x, p.pos.z) || pointInSite('B', p.pos.x, p.pos.z))) {
+      p.planting = true;
+    } else if (S.bomb.state === 'planted' && p.team === 'J') {
+      p.defusing = true;
+    }
+  } else {
+    p.planting = false;
+    p.defusing = false;
+  }
+  updateObjective(S, p, dt);
+
+  // --- bomb pickup is handled globally; show the hint through the HUD ---
+  if (hud) {
+    if (p.hasBomb && S.bomb.state === 'carried') {
+      const inSite = pointInSite('A', p.pos.x, p.pos.z) || pointInSite('B', p.pos.x, p.pos.z);
+      hud.setHint(inSite ? 'Hold E to plant the bomb' : 'You carry the bomb — take it to Site A or B');
+    } else if (S.bomb.state === 'dropped') {
+      hud.setHint('The bomb is down — walk over it to pick it up');
+    } else if (S.bomb.state === 'planted' && p.team === 'V') {
+      hud.setHint('Bomb planted — defend Site ' + S.bomb.site);
+    } else if (S.bomb.state === 'planted' && p.team === 'J') {
+      hud.setHint('Bomb planted at Site ' + S.bomb.site + ' — hold E near it to defuse');
+    } else {
+      hud.setHint('');
+    }
+  }
 }
 
-export function groundSpeed(p) {
-  return Math.hypot(p.vx, p.vz);
-}
-
-// Write the camera from the player state. Called every render, never in the sim.
-export function updateCamera(p) {
-  const eye = p.crouched ? EYE_CROUCH : EYE_STAND;
-  p.camera.position.set(p.x, eye, p.z);
-  p.camera.rotation.order = 'YXZ';
-  p.camera.rotation.y = p.yaw;
-  p.camera.rotation.x = p.pitch + p.recoilPitch;
-  p.camera.rotation.z = 0;
-  // Gun kick: the view model dips back with recoil and sways with movement.
-  p.gun.position.z = -0.42 + p.recoilPitch * 0.25;
-  p.gun.position.y = -0.24 + Math.sin(p.recoilPitch * 40) * 0.004;
+function selectWeapon(S, p, id) {
+  if (id === 'smoke' || id === 'frag') {
+    if (p.grenades[id] <= 0) return;
+    p.weapon = id;
+    return;
+  }
+  const def = weaponDef(id);
+  if (id !== 'pistol' && p.primary !== id) return;
+  // Stash the current gun's ammo before switching, so swapping guns never
+  // refills them.
+  if (p.weapon === 'pistol') {
+    p._pistolMag = p.mag;
+    p._pistolReserve = p.reserve;
+  } else if (p.weapon !== 'smoke' && p.weapon !== 'frag') {
+    p._primaryMag = p.mag;
+    p._primaryReserve = p.reserve;
+  }
+  p.weapon = id;
+  if (id === 'pistol') {
+    p.mag = p._pistolMag !== undefined ? p._pistolMag : 12;
+    p.reserve = p._pistolReserve !== undefined ? p._pistolReserve : 36;
+  } else {
+    p.mag = p._primaryMag !== undefined ? p._primaryMag : def.mag;
+    p.reserve = p._primaryReserve !== undefined ? p._primaryReserve : def.reserve;
+  }
+  p.reloading = false;
+  p.reloadT = 0;
 }
